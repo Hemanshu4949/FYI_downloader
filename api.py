@@ -1,11 +1,17 @@
-from fastapi import FastAPI, HTTPException
+# api.py
+# This is your main FastAPI application file, adapted to use cookies
+# for yt-dlp authentication.
+# Save this file as 'api.py' in your project's root directory.
+
+from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import yt_dlp
 import uvicorn
-import os   
+import os
 import shutil
-import asyncio # Import asyncio for asyncio.to_thread
+import asyncio
+import tempfile # For creating temporary cookie files
 
 app = FastAPI(
     title="Video Downloader API (Ethical Use Only)",
@@ -18,17 +24,80 @@ app = FastAPI(
 )
 
 # Directory to save downloaded files.
-# IMPORTANT: For production, this should be a carefully managed directory,
-# ideally with cleanup policies or cloud storage integration.
 DOWNLOAD_DIR = "downloads"
+# Ensure the downloads directory exists.
+# The Dockerfile also ensures this, but it's good practice here too.
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # Mount a static directory to serve the downloaded files
-# This makes files in the DOWNLOAD_DIR accessible via '/downloads/{filename}'
 app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
 
-# The ThreadPoolExecutor is no longer explicitly needed here,
-# as asyncio.to_thread uses an internal default executor.
+# Function to get yt-dlp options, including cookie handling
+def get_ydl_opts(output_template, cookie_file_path=None):
+    """Constructs yt-dlp options dictionary."""
+    opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': output_template,
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'extract_flat': True, # Use for faster metadata extraction without full downloads
+    }
+    if cookie_file_path:
+        opts['cookiefile'] = cookie_file_path
+    return opts
+
+# Function to run blocking yt-dlp operations in a separate thread
+async def run_yt_dlp_operation(url, output_template, cookie_string=None):
+    """
+    Handles yt-dlp download/extraction in a separate thread,
+    optionally using cookies from an environment variable.
+    """
+    # Use a context manager for temporary file to ensure it's cleaned up
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8') as tmp_cookie_file:
+        if cookie_string:
+            tmp_cookie_file.write(cookie_string)
+        cookie_file_path = tmp_cookie_file.name
+
+    try:
+        # Define the blocking function that yt-dlp will run
+        def blocking_download():
+            ydl_opts = get_ydl_opts(output_template, cookie_file_path)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                # yt-dlp's info dictionary contains the final filepath after post-processing
+                # For simple video/audio downloads, 'filepath' is usually directly in info.
+                # For post-processed files (like mp3 extraction), it might require inference.
+
+                final_filepath = info.get('filepath')
+                if not final_filepath:
+                    # Robust way to find the actual downloaded file if 'filepath' is not direct
+                    title = info.get('title', 'unknown_title')
+                    video_id = info.get('id', 'unknown_id')
+                    # yt-dlp adds the correct extension during post-processing
+                    potential_filename_prefix = f"{title}-{video_id}"
+
+                    # Search for the actual file in the download directory
+                    found_files = [
+                        f for f in os.listdir(DOWNLOAD_DIR)
+                        if f.startswith(potential_filename_prefix)
+                    ]
+
+                    if found_files:
+                        final_filepath = os.path.join(DOWNLOAD_DIR, found_files[0])
+                    else:
+                        raise Exception("Could not reliably determine the final downloaded file path.")
+                
+                return final_filepath
+
+        # Use asyncio.to_thread to run the blocking yt-dlp operation
+        filepath = await asyncio.to_thread(blocking_download)
+        return filepath
+    finally:
+        # Ensure the temporary cookie file is deleted
+        if os.path.exists(cookie_file_path):
+            os.remove(cookie_file_path)
+
 
 @app.get("/health", summary="Health Check")
 async def health_check():
@@ -48,81 +117,39 @@ async def download_mp3(url: str):
     Returns:
         dict: A dictionary containing the URL to the downloaded MP3 file.
     """
-    # Define yt-dlp options for MP3 conversion
-    ydl_opts = {
-        'format': 'bestaudio/best',  # Select best audio format
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio', # Use FFmpeg to extract audio
-            'preferredcodec': 'mp3',     # Preferred audio codec is MP3
-            'preferredquality': '192',   # MP3 quality (e.g., 192kbps)
-        }],
-        'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s-%(id)s.%(ext)s'), # Output template for file path
-        'quiet': True,           # Suppress verbose output
-        'no_warnings': True,     # Suppress warnings
-        'noplaylist': True,      # Do not download entire playlists
-        'extract_flat': True,    # Only extract metadata for the top-level URL
-    }
+    if not url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="URL parameter is required.")
+
+    output_template = os.path.join(DOWNLOAD_DIR, '%(title)s-%(id)s.%(ext)s')
+    
+    # Get cookie string from environment variable
+    cookie_string = os.getenv('YTDLP_COOKIES')
 
     try:
-        # Define the blocking function to run in a separate thread
-        def blocking_download_mp3():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                # yt-dlp's info dictionary contains the final filepath after post-processing
-                # For simple video/audio downloads, 'filepath' is usually directly in info.
-                # For post-processed files (like mp3 extraction), it might be in 'requested_downloads'
-                # or require a bit more inference.
-                # The most reliable way is often to infer from 'info' or check the directory
-                
-                # Check for 'filepath' in the main info_dict first, as it often points to the final file
-                final_filepath = info.get('filepath')
-                
-                # If not directly available, try to infer from common yt-dlp patterns
-                if not final_filepath:
-                    # yt-dlp often renames the file with the preferred extension
-                    title = info.get('title', 'unknown_title')
-                    video_id = info.get('id', 'unknown_id')
-                    potential_filename_pattern = f"{title}-{video_id}"
-                    
-                    # Search for the .mp3 file in the download directory that matches the pattern
-                    found_files = [
-                        f for f in os.listdir(DOWNLOAD_DIR) 
-                        if f.startswith(potential_filename_pattern) and f.endswith('.mp3')
-                    ]
-                    
-                    if found_files:
-                        final_filepath = os.path.join(DOWNLOAD_DIR, found_files[0])
-                    else:
-                        # Fallback: less reliable, try to guess or return error
-                        # This part might need further robustness based on yt-dlp's exact output.
-                        # For most cases, the 'outtmpl' and 'filepath' in info should suffice.
-                        print(f"Warning: Could not reliably determine final MP3 path for {url}. Info: {info}")
-                        # As a last resort, construct a likely name and check existence
-                        likely_filename = f"{title}-{video_id}.mp3"
-                        if os.path.exists(os.path.join(DOWNLOAD_DIR, likely_filename)):
-                            final_filepath = os.path.join(DOWNLOAD_DIR, likely_filename)
-                        else:
-                            raise Exception("Could not find the downloaded MP3 file.")
+        mp3_filepath = await run_yt_dlp_operation(url, output_template, cookie_string)
 
-                return final_filepath
+        # yt-dlp appends .mp3 if conversion is successful, so ensure we have the correct extension
+        if not mp3_filepath.endswith('.mp3'):
+            # This is a fallback if yt-dlp doesn't directly return the .mp3 path.
+            # It tries to find the .mp3 file based on the original name.
+            base_name = os.path.splitext(mp3_filepath)[0]
+            potential_mp3_path = f"{base_name}.mp3"
+            if os.path.exists(potential_mp3_path):
+                mp3_filepath = potential_mp3_path
+            else:
+                # If still can't find, raise an error or try another strategy.
+                raise Exception(f"MP3 file not found after conversion for {url}. Expected: {potential_mp3_path}")
 
-        # Use asyncio.to_thread to run the blocking function in a separate thread
-        mp3_filepath = await asyncio.to_thread(blocking_download_mp3)
 
-        # Ensure the filename is just the base name for the URL path
         mp3_filename = os.path.basename(mp3_filepath)
-
-        # Construct the full download URL that clients can use
         download_url = f"/downloads/{mp3_filename}"
 
         return {"message": "Download and conversion successful", "download_url": download_url}
 
     except yt_dlp.utils.DownloadError as e:
-        # Catch specific yt-dlp download errors
-        raise HTTPException(status_code=400, detail=f"Video download error: {e}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Video download error: {e}")
     except Exception as e:
-        # Catch any other unexpected errors
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
 
 @app.get("/download-video", summary="Download Video (Original Format)")
 async def download_video(url: str):
@@ -135,37 +162,44 @@ async def download_video(url: str):
     Returns:
         dict: A dictionary containing the URL to the downloaded video file.
     """
-    ydl_opts = {
-        'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s-%(id)s.%(ext)s'),
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'extract_flat': True,
-    }
+    if not url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="URL parameter is required.")
+
+    output_template = os.path.join(DOWNLOAD_DIR, '%(title)s-%(id)s.%(ext)s')
+    cookie_string = os.getenv('YTDLP_COOKIES') # Get cookie string for video downloads too
 
     try:
-        def blocking_download_video():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                # For direct video downloads, 'filepath' in info_dict is usually reliable
-                return info.get('filepath')
-
-        video_filepath = await asyncio.to_thread(blocking_download_video)
+        video_filepath = await run_yt_dlp_operation(url, output_template, cookie_string)
 
         if not video_filepath:
-            raise HTTPException(status_code=500, detail="Downloaded video file path could not be determined.")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Downloaded video file path could not be determined.")
 
-        # Ensure the filename is just the base name for the URL path
         video_filename = os.path.basename(video_filepath)
-        
         download_url = f"/downloads/{video_filename}"
         return {"message": "Download successful", "download_url": download_url}
 
     except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=400, detail=f"Video download error: {e}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Video download error: {e}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
 
-# This ensures the app runs when the script is executed directly
+@app.get('/downloads/{filename}')
+async def serve_downloaded_file(filename: str):
+    """
+    Serves downloaded files from the DOWNLOAD_DIR.
+    """
+    file_path = os.path.join(DOWNLOAD_DIR, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
+    
+    # Ensure the path is within the DOWNLOAD_DIR for security
+    # (send_from_directory does this automatically in Flask, but for FastAPI
+    #  it's good to be explicit or use FileResponse directly with abspath and checks)
+    return FileResponse(path=file_path, filename=filename)
+
+
+# This ensures the app runs when the script is executed directly for local development.
+# Render will use the 'uvicorn' command specified in the Dockerfile.
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
